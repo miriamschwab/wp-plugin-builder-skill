@@ -1627,3 +1627,192 @@ Uppercasing the whole namespace works too: the namespace pre-filter in that meth
 **The rule to apply generally:** normalize once, as early as possible, then check and use the same normalized value. Don't apply the transform in two places. A single normalization helper, called before the check, whose output is what actually gets used, makes divergence structurally impossible rather than merely currently-absent.
 
 **Test guards with mutations, not just the canonical spelling.** A guard verified only with the exact input it expects is untested — that is precisely how both bugs above survived an earlier round of live testing that "passed". For every block, assert on casing and padding variants, and assert the allow side too (a `forced` parameter must still be permitted, or the guard is over-blocking). Then **validate the suite by running it against the un-fixed code**: if the tests don't fail there, they aren't testing anything.
+
+---
+
+## A checkbox's absence only means "off" when the form was submitted
+
+An unticked checkbox sends nothing, so a sanitize callback that reads a missing key as "off" works for the settings form, and silently switches the setting off for every other writer. Any code that calls `update_option()` on the same option without that key (a restore, a migration, a future ability, a test harness) stores "off". In one production plugin a test's own restore step did exactly this and stripped a site-wide feature, which is how it was caught.
+
+Put a hidden marker field inside the form, and read absence as "off" only when the marker is present. Otherwise keep whatever was stored, and honour an explicit value if code supplies one:
+
+```php
+// In the field render, inside the same form:
+echo '<input type="hidden" name="myplugin_settings[my_boxes_form]" value="1">';
+
+// In the sanitize callback:
+$from_form = ! empty( $input['my_boxes_form'] );
+$current   = get_option( 'myplugin_settings', array() );
+foreach ( array( 'box_a', 'box_b' ) as $key ) {
+    if ( $from_form || isset( $input[ $key ] ) ) {
+        $sanitized[ $key ] = empty( $input[ $key ] ) ? '0' : '1';
+    } elseif ( isset( $current[ $key ] ) ) {
+        $sanitized[ $key ] = $current[ $key ];
+    }
+}
+// Never store the marker itself.
+```
+
+Pair it with "a missing key means the default" on the read side, so installs that predate the setting keep their behaviour after an update.
+
+**De-duplicate settings notices by code, not by a static flag.** WordPress runs a sanitize callback twice when an option is first created (`add_option` path), so a notice added there prints twice. A `static $done` guard fixes that but also swallows a *real* later save in the same request if the flag was set on a pass that queued nothing. Check `wp_list_pluck( get_settings_errors( 'my_option' ), 'code' )` for the notice's code before adding it instead.
+
+## A gate that reports success must have evidence it ran
+
+An audit stage that tallies findings from a summary line treats "no summary line" as clean, and a crash prints no summary line either. In one plugin, PHPCS ran out of memory on a 365 KB generated data file, printed a fatal, and the audit stage reported 0/0 having checked nothing. The fix was to count a fatal or out-of-memory message as an error. The general rule: when a tool's clean output is empty, a pass needs positive evidence that it ran, not just the absence of a failure line. A PHPStan run that hit its memory limit was the mirror image: the crash read as one finding instead of none, and it hid a real one.
+
+**Generated data does not belong in PHP arrays when it is large.** Seven thousand `array( a, b, 'c' )` rows are ~70,000 tokens for PHPCS to hold in memory, for a file nobody reads by eye. Pack it (fixed-width big-endian records, base64 in a nowdoc) and binary-search the string in place with `substr()` and `strcmp()`. One token per blob, a third of the size, and no arrays built per request.
+
+## A number input's `step` is measured from `min`, so a field's own default can be invalid
+
+An `<input type="number" min="1" step="50">` accepts 1, 51, 101, … 1451, 1501, and nothing else. `step` counts from `min`, not from zero, so every round number is rejected. Browsers enforce this at submit time and block the **entire form**, not just the offending field, with a message like "the two nearest valid values are 1451 and 1501."
+
+In a chat-widget plugin, a per-post-type character limit field shipped as `min="1" step="50"` while rendering a default value of `1500`. Opening the settings page and pressing Save, without typing anything, failed. So did entering any round number the feature was designed for.
+
+**The rule:** only set `step` when the input genuinely accepts a fixed interval, and when you do, make sure `min` and every default value sit on that interval. For a free-form quantity (a character budget, a price, a timeout) `step="1"` (the default) is correct; quantising the input buys nothing and creates a trap.
+
+**The wider lesson is about what "tested" meant here.** Every code path was exercised: the sanitizer, the option write, the filter, the code reading the new limit. PHPCS, PHPStan, Semgrep and the readme validator all passed at 0/0. None of that touches browser-side constraint validation, so the bug lived in the one layer the audit cannot reach. **Any change that adds or alters a form field must load the settings page and press Save before packaging**, with the field untouched, at its default, which is exactly the case that failed here.
+
+## A third party's published list is not curated — filter it before bundling it
+
+Provider range feeds (RFC 8805 geofeeds especially) can include blocks that are not theirs in any useful sense. Vultr's geofeed lists `2002::/16` (6to4, whose addresses embed a *person's* own IPv4), `2001:db8::/32` and the IPv4 documentation ranges. Bundled as-is, every 6to4 user would have been labelled a Vultr cloud visitor. Any generator that bundles someone else's address list should drop IANA special-purpose space (`not ip_network.is_global`, plus 6to4 and `2001::/23` explicitly) and **print what it dropped**, so a refresh is reviewed rather than trusted.
+
+## Data read from another plugin's storage needs the same sanitizing as core content
+
+Sanitizing applied to `post_content` does not automatically extend to anything else you index, render, or send onward. The two are separate code paths, and the second one is easy to forget because it was added later.
+
+A chat-widget plugin built its AI context by running `wp_strip_all_tags()` over `post_content`, then appended ACF field values raw. Most of them were plain text, so nothing looked wrong. One field held a WordPress oEmbed blockquote, which arrives with WordPress's own `wp-embed.min.js` inlined in a `<script>` block: roughly 1,500 characters of minified JavaScript were being sent to the model's API as prompt text on every visitor question, billed every time. Iframe attributes across ~17 other records added several thousand more.
+
+**Two things worth keeping:**
+
+- **`wp_strip_all_tags()` removes the *contents* of `<script>` and `<style>`, not just their tags.** Its first step is `preg_replace( '@<(script|style)[^>]*?>.*?</\1>@si', '', $text )` before `strip_tags()`. A hand-rolled `strip_tags()` call would have left the JavaScript behind as text, which is worse than leaving the markup alone, so reach for the WordPress function, not the PHP one.
+- **Enumerate every source that feeds a sink, not just the obvious one.** When a feature grows a second input (custom fields, taxonomy descriptions, user meta, another plugin's options), ask what the first input's handling does that the new one skips. Length caps, tag stripping, and whitespace collapsing all need applying per source.
+
+**Cap each source independently, too.** A per-record cap does not stop one field inside that record from consuming the whole allowance. The plugin added a 500-character per-field cap alongside the existing per-record cap for exactly this reason.
+
+## Some managed hosts redirect requests for missing `.js` files
+
+A plugin that serves generated or versioned JavaScript through a rewrite rule (a path like `/my-plugin/1.2.0.js` that doesn't exist on disk) can get an extra round trip on managed hosting. On one managed WordPress host, nginx answers any request for a `.js` file missing from disk with a `302` to `/index.php?dynamic_asset=<path>`, marked `no-store`, and only then does WordPress serve the script (with the host's own `Cache-Control` replacing yours). It works, but every load pays an uncached redirect. Measured in October 2026 with a plugin serving a versioned browser script. `.mjs`, `.json` and extensionless paths were not intercepted.
+
+**The fix:** serve the script from an extensionless path (`/my-plugin/1.2.0/bridge`) with `Content-Type: text/javascript` and `X-Content-Type-Options: nosniff`. Browsers decide by the Content-Type, not the extension. Keep the version in the path, not in `?ver=`, for the reason in "CDN caching of plugin assets on managed hosting" above. Handle the request on `template_redirect` at priority 0 and `exit`, so `redirect_canonical` never adds a trailing slash.
+
+**How to check any host:** `curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n"` against a nonexistent `.js` path under your route. A 302 to something other than your own handler means the host is intercepting by extension.
+
+## Invalidate caches from the settings that change their contents, not only from the data
+
+A cache keyed on generated output must be cleared when *anything* feeding that output changes, including plugin settings. This is easy to miss because the data-change invalidation is the one you think of, and it works, so the cache looks correct.
+
+A chat-widget plugin cached its assembled AI context in a 12-hour transient and cleared it on `save_post`. Publishing a post refreshed it immediately, so invalidation appeared solved. But the setting that chooses which post types are indexed cleared nothing, so changing it did nothing visible for up to 12 hours. To a user that reads as a broken setting, not a stale cache, and it had been shipping that way for several versions before two new indexing settings made it obvious.
+
+```php
+foreach ( array( 'myplugin_types', 'myplugin_limits', 'myplugin_excludes' ) as $option ) {
+    add_action( 'update_option_' . $option, 'myplugin_clear_cache' );
+    add_action( 'add_option_' . $option, 'myplugin_clear_cache' );
+}
+```
+
+Hook **both** `update_option_{$name}` and `add_option_{$name}`: the update hook does not fire the first time an option is written, which is precisely when a brand-new setting gets its first value.
+
+**The check to run:** list every input to the cached value, then confirm each one has an invalidation path. Settings are inputs.
+
+## PHPStan errors inside test files usually mean the test is lying about the contract
+
+Tests that pass deliberately-illegal types to prove defensive handling will fail PHPStan against the function's declared signature. The temptation is `@phpstan-ignore` or widening the parameter type. Both are wrong, and a strict audit gate should forbid both.
+
+The useful question is whether the illegal input can actually reach the function. In one plugin three such errors appeared, and the answer differed per case:
+
+- A test passed a non-callable where the contract said `callable|null`. The only caller builds that argument itself and can produce nothing else, so the test asserted a state that cannot exist. It was **deleted**, and the `null` branch stayed covered by every other test.
+- Two tests passed non-array rows to a function typed `array[]`. The realistic failure was not "a row is a string" but "a row is an array missing a key", which is type-legal. The tests were **rewritten to that shape**, keeping real coverage and dropping the fiction.
+
+Either way the fix is in the test, not in a suppression. A test that only passes because analysis was silenced is documenting a contract nobody actually has.
+
+## Size a degradation budget well above the measured value, not just above it
+
+Any feature that degrades past a threshold (a payload cap, a truncation limit, a pagination ceiling) needs headroom proportional to how the input grows, not to what it measures today.
+
+An abilities plugin published a catalog that degrades to a terser format above a byte budget. The budget was first set at 12,000 from an estimate of ~11,150. The real figure was 11,249: **751 bytes, about four more abilities**, before the entire catalog would silently drop a tier and lose the usage protocol that was the whole reason for the richer format. And the input was not even fully under that plugin's control: *any* plugin on the site can register abilities and push it over.
+
+**The rule:** measure the real value, then ask what routine growth looks like and set the ceiling past that. A snug budget converts ordinary growth into a silent cliff, and silent is the problem: graceful degradation that nobody notices is indistinguishable from a regression. Where the input can be enlarged by software you do not control, assume it will be.
+
+## Unit tests and static analysis cannot prove you read another plugin's data correctly
+
+A feature that reads another plugin's registry, metadata, or options can be completely wrong while every local gate passes. In one abilities plugin, a catalog of the site's abilities was published into the MCP server's instructions telling agents to call each one with `execute-ability`. It passed 126 unit tests, PHPStan level 5, WPCS and Semgrep, and was wrong: the WordPress Abilities API types abilities as `tool`, `resource` or `prompt` via `meta.mcp.type`, and resources and prompts are reached by different MCP methods entirely. The catalog was advertising another plugin's prompt abilities as callable. Nothing local could have caught it, because the bug was in an assumption about *another plugin's data*, and the stub-based harness had no other plugin in it.
+
+**The rule:** when a feature's correctness depends on another plugin's data model, the deploy is the test. Ship it to a site that actually has those plugins and compare against that system's own answer. The assertion worth building is an **exact set comparison in both directions** against the authority (here, catalog contents versus `discover-abilities`), asserting nothing was missing *and* nothing was extra. A count match, or a spot check of a few entries, would have passed while the bug was live.
+
+Corollary: read the source of the thing you are integrating with, at the version actually running, before assuming a field's meaning. `meta.mcp.type` and its `'tool'` default were both discoverable in the MCP Adapter's `DefaultServerFactory`; the mistake was never looking.
+
+## WebMCP in Chrome: what testing showed (Chrome 154, 2026-10)
+
+For any plugin or theme that registers WebMCP tools:
+
+- **`document.modelContext`**, not `navigator.modelContext` (gone by Chrome 153; keep it only as a fallback). `registerTool()` returns a promise: catch each registration separately so one refusal doesn't stop the rest.
+- **Return the result as plain text, and never throw.** Chrome hands the return value to the agent as a string (an MCP `{content:[…]}` envelope arrives as JSON), and replaces a thrown error's message with a generic "Tool was executed but the invocation failed". The helpful error text never reaches the agent.
+- **Annotations are WebMCP's own:** `readOnlyHint`, `consequentialHint` (set it on anything that sends, buys or changes something the user should confirm), `untrustedContentHint`. MCP's `destructiveHint` / `openWorldHint` are ignored.
+- **Test with a real browser, not a polyfill:** a throwaway profile (`--user-data-dir=<scratch>`) with `{"browser":{"enabled_labs_experiments":["enable-webmcp-testing@1"]}}` in its `Local State`, plus `--unsafely-treat-insecure-origin-as-secure=http://site.local` for an http local site, driven over `--remote-debugging-port` with Node's built-in WebSocket. In that harness `executeTool(tool, input)` needs `input` as a **JSON string**. On a live https site with an origin-trial token, an unflagged profile is the real end-to-end test.
+- **Origin-trial tokens** decode as base64: version byte (2 or 3), 64-byte signature, 4-byte big-endian length, JSON `{origin, feature, expiry, isSubdomain?, isThirdParty?}`. Enough to validate origin, feature and expiry on save; the signature is the browser's job. The WebMCP feature name is `WebMCP`.
+
+## When you implement a spec, check what the real consumers read
+
+A written spec and the software that actually consumes the format can disagree, and the spec being newer doesn't make it the one that matters. Before emitting a format for other software to read, find at least one real consumer and read its parsing code, not just the spec.
+
+Found in October 2026, building an NLWeb schema map. NLWeb's Schema Feeds spec (a March 2026 draft) puts each feed's type in an `<sf:contentType>` element. NLWeb's own crawler (`nlweb-ai/crawler`, last changed October 2025) reads a `contentType` *attribute* on `<url>` and never looks for the element, which is also what Yoast SEO writes. A map built only to the spec was invisible to NLWeb's own crawler, and the first draft of a bug report called Yoast's correct-for-the-crawler output a bug.
+
+**What to do:**
+- **Name the reader.** "Spec-conformant" and "works with X" are separate claims; test both.
+- **When they disagree, emit both forms** if the format tolerates extras. XML readers ignore unknown attributes and foreign-namespace elements, so `<url contentType="…">` plus `<sf:contentType>` satisfies both at no cost. Assert in tests that the two values match.
+- **Check for an undocumented origin before "fixing" a format.** The plugin's previous schema map used a root element and namespace that appear in no spec, with nothing recording where they came from. Write the source URL and version into the code comment whenever you implement a format.
+- **Check the issue tracker of the nearest implementer** before shipping discovery directives. Yoast had already removed its robots.txt `Schemamap:` line because Google Search Console flags it as "Syntax not understood" (Yoast/wordpress-seo#23139), so the plugin's line became a setting, on by default, rather than unconditional.
+
+## When a protocol changes shape, answer each caller in the shape it sent
+
+A plugin that implements someone else's protocol will see the protocol move under it. Switching the endpoint to the new shape breaks every client already using the old one; staying on the old shape leaves clients of the new version with errors. Do both: work out the version from the request itself, and answer in the matching shape.
+
+Found in October 2026 in a plugin's NLWeb `/ask` endpoint, which read `query` as a string. NLWeb protocol v0.54 nests it (`{"query": {"text": "..."}}`) and changed the response envelope too (`_meta.response_type` `Answer` / `Failure`, results as schema.org objects, unnamed SSE `data:` events). Every v0.54 client got a 400 `missing_query`. The fix detects v0.54 from the body (`query` is an object, or `meta.api_version` is present) and answers it in NLWeb_Core's shapes, while a flat `query` gets exactly the response it got before.
+
+**What to do:**
+- **Detect from the request, not a setting.** The caller already said which version it speaks. A site-wide "protocol version" option makes the owner choose which clients to break.
+- **Keep the old shape byte-for-byte for old callers.** Test both paths, and include the old error responses: they are part of the contract too.
+- **Take the new shapes from the reference implementation's code, not only the spec prose.** For NLWeb that meant reading NLWeb_Core's handler and SSE interface, plus NLWeb's own WordPress plugin. See also "When you implement a spec, check what the real consumers read" above.
+- **Describe both shapes wherever the endpoint is documented** (OpenAPI `oneOf` for the request body, every response media type, including `text/event-stream`). A checker that reads the spec rather than calling the endpoint only knows what the spec says.
+
+## PHP renames dots and spaces in request parameter names
+
+PHP rewrites `.` and space to `_` in the *names* of query-string and form parameters before they reach `$_GET`, `$_POST` or `$_REQUEST` (a leftover from `register_globals`). A request for `/ask?prefer.streaming=true` arrives as `$_GET['prefer_streaming']`, so code that checks `$_GET['prefer.streaming']` never matches, and the request silently falls through to the default behaviour. Square brackets have their own meaning: `prefer[streaming]=true` arrives as an array, `$_GET['prefer']['streaming']`. JSON request bodies are unaffected, because `json_decode()` keeps keys as sent.
+
+Found in October 2026: NLWeb names its streaming switch `prefer.streaming`. In a JSON body it worked; as a query parameter it did nothing.
+
+**What to do:** when a protocol uses dotted parameter names, read the underscore form too (`prefer_streaming`) and say why in a comment. To see what a client really sent, read the raw `$_SERVER['QUERY_STRING']`. **Test parameter handling with the client's literal URL**, not with a hand-built `$_GET` array in a unit test: the rename happens before PHP code runs, so a stubbed superglobal can't reproduce it.
+
+## When storing reduced IP addresses, reduce the bytes, not the text
+
+Splitting `inet_ntop()` output on `:` to keep "the first four IPv6 groups" is wrong whenever the compression `::` falls in the first half: `2001:db8::1` becomes `2001:db8::1::`, which is not an address and still carries interface-ID bits, a privacy reduction that did not reduce. Read the groups from `unpack( 'n8', inet_pton( $ip ) )` and write them out uncompressed. Test the reduction on a compressed address, and assert it is idempotent (`reduce( reduce( x ) ) === reduce( x )`), because code elsewhere uses "equals its own reduction" to recognise a stored network.
+
+## WordPress 7.0 forces a 101-word excerpt on every admin request
+
+`wp-includes/blocks/post-excerpt.php` (WP 7.0+) does `if ( is_admin() ) add_filter( 'excerpt_length', 'block_core_post_excerpt_excerpt_length', PHP_INT_MAX );`. The callback returns 101 so the block editor's own excerpt-length control works. Its side effect: **any auto-excerpt a plugin builds during an admin request ignores the site's `excerpt_length`.** A plugin that generates and stores content (on save from the classic editor, from a "regenerate all" button, from an admin-post handler) gets ~100-word excerpts, while the same code run from the block editor (a REST request), WP-CLI, cron or the front end gets the site's length. It looks like inconsistent data, not a bug.
+
+Fix it at the call site: lift that one registration around your own `get_the_excerpt()` call and put it back. Read it from the hook table rather than naming it for `remove_filter`/`add_filter`. That restores the exact priority and `accepted_args`, and it avoids PHPStan failures against WordPress stubs older than 7.0, which don't know the function exists:
+
+```php
+global $wp_filter;
+$lifted = array();
+if ( isset( $wp_filter['excerpt_length'] ) && $wp_filter['excerpt_length'] instanceof WP_Hook ) {
+    foreach ( $wp_filter['excerpt_length']->callbacks as $priority => $entries ) {
+        foreach ( $entries as $entry ) {
+            if ( 'block_core_post_excerpt_excerpt_length' === $entry['function'] ) {
+                $lifted[] = array( $priority, $entry );
+            }
+        }
+    }
+}
+foreach ( $lifted as $item ) {
+    remove_filter( 'excerpt_length', $item[1]['function'], $item[0] );
+}
+$excerpt = get_the_excerpt( $post );
+foreach ( $lifted as $item ) {
+    add_filter( 'excerpt_length', $item[1]['function'], $item[0], $item[1]['accepted_args'] );
+}
+```
+
+**Test it under the real condition**, not by reasoning: in a WP-CLI eval, register core's filter exactly as core does (`add_filter( 'excerpt_length', 'block_core_post_excerpt_excerpt_length', PHP_INT_MAX )`), confirm raw `get_the_excerpt()` now returns ~100 words, then confirm your output matches the CLI build and the filter is back at `PHP_INT_MAX` afterwards.

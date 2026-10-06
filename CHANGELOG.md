@@ -2,6 +2,27 @@
 
 All notable changes to this skill are recorded here. Entries are newest-first.
 
+## 2026-10-06
+
+Sixteen sections learned since August, written up without project names or host-specific detail.
+
+- Added: **When a protocol changes shape, answer each caller in the shape it sent**: detect the protocol version from the request, keep the old response shape exactly for old callers, and take the new shapes from the reference implementation's code. Example: NLWeb protocol v0.54's nested `query.text`.
+- Added: **PHP renames dots and spaces in request parameter names**: `?prefer.streaming=true` arrives as `$_GET['prefer_streaming']`, so dotted protocol parameters silently do nothing unless the underscore form is read too.
+- Added: **When you implement a spec, check what the real consumers read**: a spec and the software that consumes the format can disagree; NLWeb's Schema Feeds spec and NLWeb's own crawler are the example.
+- Added: **Unit tests and static analysis cannot prove you read another plugin's data correctly**: the deploy is the test, with an exact set comparison in both directions against the authority.
+- Added: **Size a degradation budget well above the measured value, not just above it.**
+- Added: **PHPStan errors inside test files usually mean the test is lying about the contract**: fix the test, don't suppress the error.
+- Added: **A checkbox's absence only means "off" when the form was submitted**: the hidden-marker pattern, and de-duplicating settings notices by code.
+- Added: **Invalidate caches from the settings that change their contents, not only from the data**, hooking both `update_option_{$name}` and `add_option_{$name}`.
+- Added: **A number input's `step` is measured from `min`**, so a field's own default can block the whole form from saving.
+- Added: **Data read from another plugin's storage needs the same sanitizing as core content**, including why `wp_strip_all_tags()` beats `strip_tags()`.
+- Added: **A gate that reports success must have evidence it ran**: a crashed linter prints no findings, and large generated PHP arrays are what crash it.
+- Added: **Some managed hosts redirect requests for missing `.js` files**: serve generated scripts from an extensionless path.
+- Added: **WebMCP in Chrome: what testing showed (Chrome 154)**: `document.modelContext`, plain-text results, WebMCP's own annotations, real-browser testing, origin-trial token format.
+- Added: **WordPress 7.0 forces a 101-word excerpt on every admin request**, and how to lift that filter around your own call.
+- Added: **A third party's published list is not curated**: filter IANA special-purpose space out of bundled provider ranges.
+- Added: **When storing reduced IP addresses, reduce the bytes, not the text.**
+
 ## 2026-08-12
 
 - Changed: removed the last named plugins from the skill. The Abilities API section cited four plugins as provenance — one of which no longer exists — and the `scrollIntoView` section named a specific plugin. Both now describe the source generically ("three production plugins", "a chat-widget plugin"); the technical guidance is unchanged, since the names were sourcing rather than instruction.

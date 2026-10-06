@@ -28,6 +28,11 @@ A [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills) —
 - **Cron and scheduled tasks** — scheduling, clearing, idempotency, and manual triggers
 - **Debugging checklist** — the usual "it doesn't work" causes and where to look first
 - **Security guards and input normalization** — why a guard must normalize input the same way the code it protects does, including case-insensitive REST route matching and `sanitize_key()` behaviour
+- **Settings and caching traps** — checkbox absence on non-form writes, cache invalidation from settings, number-input `step` blocking a save
+- **Testing what local gates can't** — reading another plugin's data, PHPStan errors in tests, audit stages that crash silently, degradation budgets
+- **Specs and protocols** — checking what real consumers read, answering each protocol version in its own shape, PHP's renaming of dotted parameter names
+- **WebMCP in Chrome** — the API surface, result and annotation rules, and how to test in a real browser
+- **WordPress and hosting quirks** — the WordPress 7.0 admin excerpt length, managed hosts that redirect missing `.js` files, sanitizing data from other plugins, filtering bundled IP lists, reducing IPv6 addresses correctly
 
 ## Changelog
 
